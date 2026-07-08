@@ -316,6 +316,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
             hass, tuya_api.async_connect(), "localtuya-cloudAPI"
         )
 
+        # Connection diagnostics: poll the cloud periodically so that
+        # cloud-side online/offline transitions of the devices get logged.
+        async def _poll_cloud_status(_now):
+            await tuya_api.async_get_devices_list(force_update=True)
+
+        entry.async_on_unload(
+            async_track_time_interval(hass, _poll_cloud_status, timedelta(minutes=5))
+        )
+
     hass_localtuya = HassLocalTuyaData(tuya_api, {})
     hass.data[DOMAIN][entry.entry_id] = hass_localtuya
 

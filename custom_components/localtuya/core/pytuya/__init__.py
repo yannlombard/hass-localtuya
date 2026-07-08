@@ -530,6 +530,14 @@ class TuyaProtocol(asyncio.Protocol, ContextualLogger):
         async def _action(on_devs, off_devs):
             try:
                 self.debug(f"Sub-Devices States Update: {on_devs=} {off_devs=}")
+                current = (sorted(on_devs), sorted(off_devs))
+                if getattr(self, "_last_subdev_states", None) != current:
+                    self._last_subdev_states = current
+                    self.info(
+                        "[CONN][SUB] Gateway reports sub-devices online=%s offline=%s",
+                        current[0],
+                        current[1],
+                    )
                 listener = self.listener and self.listener()
                 if listener is None:
                     return
@@ -602,6 +610,8 @@ class TuyaProtocol(asyncio.Protocol, ContextualLogger):
     def connection_made(self, transport):
         """Did connect to the device."""
         self.transport = transport
+        peer = transport.get_extra_info("peername") if transport else None
+        self.info("[CONN] TCP connection established with %s (protocol v%s)", peer, self.version)
 
     def keep_alive(self, is_gateway: bool = False):
         """
@@ -625,8 +635,9 @@ class TuyaProtocol(asyncio.Protocol, ContextualLogger):
                     break
                 except asyncio.TimeoutError:
                     fail_attempt += 1
+                    self.info("[CONN] Heartbeat timeout %s/2 (device did not reply)", fail_attempt)
                     if fail_attempt >= 2:
-                        self.debug("Heartbeat failed due to timeout, disconnecting")
+                        self.warning("[CONN] Heartbeat failed twice, closing the connection")
                         break
                 except Exception as ex:  # pylint: disable=broad-except
                     self.exception("Heartbeat failed (%s), disconnecting", ex)
@@ -659,7 +670,7 @@ class TuyaProtocol(asyncio.Protocol, ContextualLogger):
 
     def connection_lost(self, exc):
         """Disconnected from device."""
-        self.debug("Connection lost: %s", exc, force=True)
+        self.info("[CONN] Connection lost: %r", exc)
 
         listener = self.listener and self.listener()
         self.clean_up_session()

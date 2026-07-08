@@ -12,6 +12,16 @@ import time
 DEVICES_UPDATE_INTERVAL = 300
 DEVICES_UPDATE_INTERVAL_FORCED = 10
 
+# Hints appended to cloud error logs for well-known Tuya error codes.
+CLOUD_ERROR_HINTS = {
+    1004: " (invalid signature - check client_id/secret)",
+    1010: " (token expired)",
+    1011: " (token invalid)",
+    1106: " (permission denied - check the IoT project is linked to the app account)",
+    28841002: " (API not subscribed - renew 'IoT Core' trial on platform.tuya.com)",
+    28841105: " (subscription EXPIRED - renew 'IoT Core' trial on platform.tuya.com)",
+}
+
 TUYA_ENDPOINTS = {
     # Regions code
     "Central Europe Data Center": "eu",
@@ -113,6 +123,8 @@ class TuyaCloudApi:
         self.cached_device_list = {}
 
         self._last_devices_update = int(time.time())
+        # Snapshot of cloud-reported online status, to log transitions.
+        self._last_online_map: dict | None = None
 
     def generate_payload(self, method, timestamp, url, headers, body=None):
         """Generate signed payload for requests."""
@@ -154,32 +166,44 @@ class TuyaCloudApi:
         }
         full_url = self._base_url + url
 
+        resp_json = None
         async with self._session as session:
             try:
                 if method == "GET":
                     async with session.get(
                         full_url, headers=dict(default_par, **headers)
                     ) as resp:
-                        return await resp.json()
+                        resp_json = await resp.json()
 
-                if method == "POST":
+                elif method == "POST":
                     async with session.post(
                         full_url,
                         headers=dict(default_par, **headers),
                         data=json.dumps(body),
                     ) as resp:
-                        return await resp.json()
+                        resp_json = await resp.json()
 
-                if method == "PUT":
+                elif method == "PUT":
                     async with session.put(
                         full_url,
                         headers=dict(default_par, **headers),
                         data=json.dumps(body),
                     ) as resp:
-                        return await resp.json()
+                        resp_json = await resp.json()
             except (aiohttp.ClientConnectionError, TimeoutError) as ex:
-                self._logger.debug(f"Failed to send request to tuya cloud: {ex}")
+                self._logger.warning(
+                    f"[CONN][CLOUD] Network error reaching Tuya cloud "
+                    f"({method} {url}): {ex}"
+                )
                 return False
+
+        if isinstance(resp_json, dict) and not resp_json.get("success", True):
+            code = resp_json.get("code")
+            self._logger.warning(
+                f"[CONN][CLOUD] {method} {url} failed: code={code} "
+                f"msg={resp_json.get('msg')!r}{CLOUD_ERROR_HINTS.get(code, '')}"
+            )
+        return resp_json
 
     async def async_get_access_token(self) -> str | None:
         """Obtain a valid access token."""
@@ -191,7 +215,9 @@ class TuyaCloudApi:
             resp := await self.async_make_request("GET", "/v1.0/token?grant_type=1")
         ):
             self._token_expire_time = 0
-            return self._logger.debug(f"Failed to retrieve a valid token")
+            return self._logger.warning(
+                "[CONN][CLOUD] Failed to retrieve an access token (no response)"
+            )
 
         if not resp["success"]:
             self._token_expire_time = 0
@@ -202,6 +228,9 @@ class TuyaCloudApi:
         expire_time = int(req_results.get("expire_time", 3600))
         self._token_expire_time = int(time.time()) + expire_time
         self._access_token = resp["result"]["access_token"]
+        self._logger.info(
+            f"[CONN][CLOUD] Access token refreshed, valid for {expire_time}s"
+        )
         return "ok"
 
     async def async_get_devices_list(self, force_update=False) -> str | None:
@@ -227,8 +256,38 @@ class TuyaCloudApi:
 
         self.device_list.update({dev["id"]: dev for dev in resp["result"]})
 
+        self._log_online_transitions()
+
         self._last_devices_update = int(time.time())
         return "ok"
+
+    def _log_online_transitions(self):
+        """Log cloud-reported online/offline status changes for all devices."""
+        online_map = {
+            dev_id: dev.get("online") for dev_id, dev in self.device_list.items()
+        }
+        previous = self._last_online_map
+        self._last_online_map = online_map
+
+        if previous is None:
+            offline = [
+                f"{dev.get('name', '?')} ({dev_id})"
+                for dev_id, dev in self.device_list.items()
+                if not dev.get("online", True)
+            ]
+            self._logger.info(
+                f"[CONN][CLOUD] {len(online_map)} devices in cloud account; "
+                f"reported OFFLINE by the cloud: {offline if offline else 'none'}"
+            )
+            return
+
+        for dev_id, is_online in online_map.items():
+            if previous.get(dev_id, is_online) != is_online:
+                name = self.device_list[dev_id].get("name", "?")
+                self._logger.info(
+                    f"[CONN][CLOUD] Cloud online status changed for {name!r} "
+                    f"({dev_id}): {previous.get(dev_id)} -> {is_online}"
+                )
 
     async def async_get_devices_dps_query(self):
         """Update All the devices dps_data."""

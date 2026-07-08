@@ -187,6 +187,13 @@ class TuyaDevice(TuyaListener, ContextualLogger):
         max_retries = 3
         update_localkey = False
 
+        # First connection or first drop: log at INFO. Reconnect-loop retries stay quiet
+        # here; _async_reconnect logs its own periodic summary.
+        if self._task_reconnect is None:
+            self.info(
+                f"[CONN] Connecting to {host} (device_id={self._device_config.id}, "
+                f"proto=v{self._device_config.protocol_version}, subdevice={bool(self.is_subdevice)})"
+            )
         self.debug(f"Trying to connect to: {host}...", force=True)
         # Connect to the device, interface should be connected for next steps.
         while retry < max_retries and not self.is_closing:
@@ -224,12 +231,16 @@ class TuyaDevice(TuyaListener, ContextualLogger):
                 return
             except OSError as e:
                 await self.abort_connect()
+                # ContextualLogger.warning dedups identical messages, so this
+                # won't spam while the device stays unreachable.
+                if not self.is_sleep:
+                    err_name = errno.errorcode.get(e.errno, e.errno)
+                    self.warning(f"[CONN] Connect to {host} failed: {err_name} {e}")
                 if (
                     e.errno == errno.EHOSTUNREACH
                     and not self._status
                     and not self.is_sleep
                 ):
-                    self.warning(f"Connection failed: {e}")
                     break
             except Exception as ex:  # pylint: disable=broad-except
                 await self.abort_connect()
@@ -281,7 +292,7 @@ class TuyaDevice(TuyaListener, ContextualLogger):
 
         # Connect and configure the entities, at this point the device should be ready to get commands.
         if self.connected and not self.is_closing:
-            self.debug(f"Success: connected to: {host}", force=True)
+            self.info(f"[CONN] Connected to {host}", clear_warning=True)
             # Attempt to restore status for all entities that need to first set
             # the DPS value before the device will respond with status.
             for entity in self._entities:
@@ -460,6 +471,12 @@ class TuyaDevice(TuyaListener, ContextualLogger):
                     break
 
                 attempts += 1
+                # ~1 log/min at the 5s interval, to keep a trace without flooding.
+                if attempts == 1 or attempts % 12 == 0:
+                    self.info(
+                        f"[CONN] Device still unreachable "
+                        f"(reconnect attempt {attempts}, host={self._device_config.host})"
+                    )
                 scale = (
                     2
                     if (self.subdevice_state == SubdeviceState.ABSENT)
@@ -515,8 +532,19 @@ class TuyaDevice(TuyaListener, ContextualLogger):
         await cloud_api.async_get_devices_list(force_update=True)
 
         cloud_devs = cloud_api.device_list
+        if dev_id not in cloud_devs:
+            self.warning(
+                f"[CONN][CLOUD] Device {dev_id} NOT found in the cloud account "
+                f"({len(cloud_devs)} devices listed). Was it re-paired under a new ID?"
+            )
         if dev_id in cloud_devs:
-            cloud_localkey = cloud_devs[dev_id].get(CONF_LOCAL_KEY)
+            cloud_info = cloud_devs[dev_id]
+            cloud_localkey = cloud_info.get(CONF_LOCAL_KEY)
+            self.info(
+                f"[CONN][CLOUD] Cloud info for {dev_id}: online={cloud_info.get('online')}, "
+                f"name={cloud_info.get('name')!r}, ip={cloud_info.get('ip')!r}, "
+                f"localkey_changed={bool(cloud_localkey) and self.local_key != cloud_localkey}"
+            )
             if not cloud_localkey or self.local_key == cloud_localkey:
                 return
 
@@ -614,6 +642,10 @@ class TuyaDevice(TuyaListener, ContextualLogger):
         if not self._interface:
             return
         self._interface = None
+        self.info(
+            f"[CONN] Disconnected: {exc!r} "
+            f"(host={self._device_config.host}, closing={self.is_closing})"
+        )
 
         if self._unsub_refresh:
             self._unsub_refresh()
@@ -645,6 +677,13 @@ class TuyaDevice(TuyaListener, ContextualLogger):
         node_id = self._node_id
         old_state = self.subdevice_state
         self.subdevice_state = state
+
+        if old_state != state:
+            old_name = getattr(old_state, "name", old_state)
+            self.info(
+                f"[CONN][SUB] Sub-device {node_id} state: {old_name} -> {state.name} "
+                f"(offline_count={self._subdevice_off_count})"
+            )
 
         # This will trigger if state is absent twice.
         if state == SubdeviceState.ABSENT:
