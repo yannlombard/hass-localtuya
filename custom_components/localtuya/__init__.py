@@ -24,10 +24,13 @@ from homeassistant.const import (
     CONF_REGION,
     EVENT_HOMEASSISTANT_STOP,
     SERVICE_RELOAD,
+    STATE_OFF,
+    STATE_ON,
 )
 from homeassistant.core import Event, HomeAssistant, ServiceCall, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.util import dt as dt_util, slugify
 
 from .coordinator import TuyaDevice, HassLocalTuyaData, TuyaCloudApi
 from .config_flow import ENTRIES_VERSION
@@ -312,14 +315,45 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     if no_cloud:
         _LOGGER.info(f"Cloud API account not configured.")
     else:
+        # Connection diagnostics: expose the cloud-reported online status of
+        # every device in the Tuya account as binary_sensor.tuya_cloud_<name>.
+        # States are set directly (no entity registry), so they exist only
+        # after the first successful cloud poll following a restart.
+        @callback
+        def _publish_cloud_status():
+            polled_at = dt_util.now().isoformat()
+            for dev_id, dev in tuya_api.device_list.items():
+                name = dev.get("name") or dev_id
+                is_online = bool(dev.get("online"))
+                hass.states.async_set(
+                    f"binary_sensor.tuya_cloud_{slugify(name)}",
+                    STATE_ON if is_online else STATE_OFF,
+                    {
+                        "friendly_name": f"Tuya cloud {name}",
+                        "device_class": "connectivity",
+                        "icon": (
+                            "mdi:cloud-check-outline"
+                            if is_online
+                            else "mdi:cloud-off-outline"
+                        ),
+                        "device_id": dev_id,
+                        "polled_at": polled_at,
+                    },
+                )
+
+        async def _connect_and_publish():
+            await tuya_api.async_connect()
+            _publish_cloud_status()
+
         entry.async_create_background_task(
-            hass, tuya_api.async_connect(), "localtuya-cloudAPI"
+            hass, _connect_and_publish(), "localtuya-cloudAPI"
         )
 
         # Connection diagnostics: poll the cloud periodically so that
         # cloud-side online/offline transitions of the devices get logged.
         async def _poll_cloud_status(_now):
-            await tuya_api.async_get_devices_list(force_update=True)
+            if await tuya_api.async_get_devices_list(force_update=True) == "ok":
+                _publish_cloud_status()
 
         entry.async_on_unload(
             async_track_time_interval(hass, _poll_cloud_status, timedelta(minutes=5))
